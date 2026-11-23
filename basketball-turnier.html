@@ -357,7 +357,7 @@ function defaultState() {
     logos: DEFAULT_LOGOS.slice(), logosV: 1,
     games: [], slots: [], current: 0, stale: false,
     clock: { phase: 'idle', remaining: 12 * 60000, endsAt: 0, musicFired: false },
-    music: { source: 'spotify', playlist: '', offset: 60, stopAtEnd: true, horn: true, whistle: true, whistleResume: false, hornVol: 0.7, localVol: 0.85, shuffle: true },
+    music: { source: 'spotify', playlist: '', offset: 60, stopAtEnd: true, horn: true, whistle: true, whistleResume: false, whistleType: 'clean', hornType: 'buzzer', hornVol: 0.7, localVol: 0.85, shuffle: true },
     opts: { autoChangeover: true, autoNext: false },
     kg: kgDefaults(),
     updated: Date.now()
@@ -634,13 +634,46 @@ function ac() {
   if (actx && actx.state === 'suspended') actx.resume();
   return actx;
 }
-function horn(dur = 1.5) {
-  const c = ac(); if (!c) return;
-  const t = c.currentTime, v = +S.music.hornVol || 0.7;
-  const g = c.createGain(); g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.03);
-  g.gain.setValueAtTime(v, t + dur - 0.12); g.gain.linearRampToValueAtTime(0, t + dur);
-  const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 2400; f.connect(g); g.connect(c.destination);
+/* Eigene Sounddateien (separat gespeichert, damit sie nicht bei jeder Synchronisation mitgeschickt werden) */
+const SND_KEY = 'bbturnier-sounds';
+let customSnd = {}; try { customSnd = JSON.parse(localStorage.getItem(SND_KEY)) || {}; } catch (e) {}
+const sigVol = () => Math.min(1, +S.music.hornVol || 0.7);
+function playCustom(kind) {
+  const u = customSnd[kind]; if (!u) return false;
+  try { const a = new Audio(u); a.volume = sigVol(); a.play().catch(() => {}); return true; } catch (e) { return false; }
+}
+function envGain(c, t, v, dur, att, rel) {
+  const g = c.createGain();
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + att);
+  g.gain.setValueAtTime(v, t + dur - rel); g.gain.linearRampToValueAtTime(0, t + dur);
+  return g;
+}
+// Hallen-Buzzer wie bei der Basketball-Spieluhr: hart, verzerrt, gleichbleibend
+function synthBuzzer(c, dest, t, v, dur = 1.8) {
+  const out = envGain(c, t, v * 0.37, dur, 0.006, 0.04);
+  const pre = c.createGain(); pre.gain.value = 0.6;
+  const sh = c.createWaveShaper(), n = 2048, cu = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const x = i / (n - 1) * 2 - 1; cu[i] = Math.tanh(3.2 * x) / Math.tanh(3.2); }
+  sh.curve = cu;
+  const pk = c.createBiquadFilter(); pk.type = 'peaking'; pk.frequency.value = 1150; pk.Q.value = 0.9; pk.gain.value = 7;
+  const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 110;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 6500;
+  pre.connect(sh); sh.connect(pk); pk.connect(hp); hp.connect(lp); lp.connect(out); out.connect(dest);
+  [['square', 220, 0.5], ['square', 221.7, 0.45], ['sawtooth', 440.8, 0.25], ['square', 330.4, 0.12]].forEach(([type, f, gv]) => {
+    const o = c.createOscillator(), g = c.createGain(); o.type = type; o.frequency.value = f; g.gain.value = gv;
+    o.connect(g); g.connect(pre); o.start(t); o.stop(t + dur);
+  });
+}
+// Signalhorn (bisheriger Klang)
+function synthHornClassic(c, dest, t, v, dur = 1.5) {
+  const g = envGain(c, t, v, dur, 0.03, 0.12);
+  const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 2400; f.connect(g); g.connect(dest);
   [233, 294, 350].forEach(fr => { const o = c.createOscillator(), og = c.createGain(); o.type = 'sawtooth'; o.frequency.value = fr; og.gain.value = 0.28; o.connect(og); og.connect(f); o.start(t); o.stop(t + dur); });
+}
+function horn() {
+  if (S.music.hornType === 'file' && playCustom('horn')) return;
+  const c = ac(); if (!c) return;
+  (S.music.hornType === 'classic' ? synthHornClassic : synthBuzzer)(c, c.destination, c.currentTime + 0.01, sigVol());
 }
 function beep(times = 2) {
   const c = ac(); if (!c) return;
@@ -1040,7 +1073,20 @@ function renderMusic() {
       <label class="chk"><input type="checkbox" id="m-wh" data-mus="whistle" ${m.whistle ? 'checked' : ''}> Anpfiff (Schiedsrichterpfeife), wenn eine Runde gestartet wird</label>
       <label class="chk" style="margin-top:.3rem"><input type="checkbox" id="m-whr" data-mus="whistleResume" ${m.whistleResume ? 'checked' : ''}> Anpfiff auch beim Weiterlaufen nach einer Pause</label>
       <label class="chk" style="margin-top:.3rem"><input type="checkbox" id="m-horn" data-mus="horn" ${m.horn ? 'checked' : ''}> Hupe bei Spielende</label>
+      <div class="fields" style="margin-top:.6rem">
+        <label>Klang des Pfiffs<select id="m-wt" data-mus="whistleType">
+          <option value="clean" ${m.whistleType === 'clean' ? 'selected' : ''}>Klarer Pfiff (Pfeife ohne Kugel, wie im Basketball)</option>
+          <option value="trill" ${m.whistleType === 'trill' ? 'selected' : ''}>Trillerpfeife</option>
+          <option value="file" ${m.whistleType === 'file' ? 'selected' : ''}>Eigene Sounddatei</option></select></label>
+        <label>Klang der Hupe<select id="m-ht" data-mus="hornType">
+          <option value="buzzer" ${m.hornType === 'buzzer' ? 'selected' : ''}>Hallen-Buzzer (Basketball-Spieluhr)</option>
+          <option value="classic" ${m.hornType === 'classic' ? 'selected' : ''}>Signalhorn</option>
+          <option value="file" ${m.hornType === 'file' ? 'selected' : ''}>Eigene Sounddatei</option></select></label>
+      </div>
+      ${m.whistleType === 'file' ? sndFileRow('whistle', 'Pfiff-Datei') : ''}
+      ${m.hornType === 'file' ? sndFileRow('horn', 'Hupen-Datei') : ''}
       <div class="row"><label>Lautstärke <input type="range" min="0.1" max="1" step="0.05" id="m-hv" data-mus="hornVol" value="${m.hornVol}"></label><button class="btn sm" data-act="whistleTest">Pfiff testen</button><button class="btn sm" data-act="hornTest">Hupe testen</button></div>
+      ${m.whistleType === 'file' || m.hornType === 'file' ? '<p class="hint">Eigene Dateien (MP3/WAV, bis 1,5 MB) bleiben in diesem Browser gespeichert. Sie stecken nicht in der Sicherungsdatei.</p>' : ''}
       <p class="hint">Tastatur: <b>Leertaste</b> = Start/Pause (wenn kein Eingabefeld aktiv ist).</p>
     </div>
     <div class="card"><h2>Musik in der letzten Spielminute</h2>
@@ -1074,15 +1120,31 @@ function renderMusicFiles() {
 }
 
 /* ---- Druckansicht ---- */
-function whistle(dur = 1.2) {
-  const c = ac(); if (!c) return;
-  const t = c.currentTime + 0.02, v = Math.min(1, (+S.music.hornVol || 0.7) * 1.2);
-  const master = c.createGain();
-  master.gain.setValueAtTime(0, t); master.gain.linearRampToValueAtTime(v, t + 0.025);
-  master.gain.setValueAtTime(v, t + dur - 0.09); master.gain.linearRampToValueAtTime(0, t + dur);
+// Klarer Pfiff wie eine Pfeife ohne Kugel (Fox-40-Stil): zwei eng benachbarte Töne, harter Einsatz
+function synthWhistleClean(c, dest, t, v, dur = 0.95) {
+  const out = envGain(c, t, v, dur, 0.012, 0.05);
+  const comp = c.createDynamicsCompressor(); comp.threshold.value = -10; comp.ratio.value = 4;
+  const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1200;
+  hp.connect(out); out.connect(comp); comp.connect(dest);
+  const vib = c.createOscillator(); vib.frequency.value = 6.5;
+  const vg = c.createGain(); vg.gain.value = 10; vib.connect(vg);
+  [[3050, 0.5], [3235, 0.42], [6100, 0.05]].forEach(([f, gv]) => {
+    const o = c.createOscillator(), g = c.createGain(); o.type = 'sine';
+    o.frequency.setValueAtTime(f * 0.93, t); o.frequency.exponentialRampToValueAtTime(f, t + 0.04);
+    vg.connect(o.frequency); g.gain.value = gv; o.connect(g); g.connect(hp); o.start(t); o.stop(t + dur);
+  });
+  const len = Math.floor(c.sampleRate * dur), buf = c.createBuffer(1, len, c.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  const nz = c.createBufferSource(); nz.buffer = buf;
+  const bp = c.createBiquadFilter(); bp.type = 'highpass'; bp.frequency.value = 4500;
+  const ng = c.createGain(); ng.gain.value = 0.025; nz.connect(bp); bp.connect(ng); ng.connect(hp);
+  vib.start(t); vib.stop(t + dur); nz.start(t); nz.stop(t + dur);
+}
+// Trillerpfeife (bisheriger Klang)
+function synthWhistleTrill(c, dest, t, v, dur = 1.2) {
+  const master = envGain(c, t, v, dur, 0.025, 0.09);
   const comp = c.createDynamicsCompressor(); comp.threshold.value = -12; comp.ratio.value = 6;
-  master.connect(comp); comp.connect(c.destination);
-  // Triller der Erbse: schnelle Frequenz- und Lautstärkemodulation
+  master.connect(comp); comp.connect(dest);
   const lfo = c.createOscillator(); lfo.frequency.value = 34;
   const fm1 = c.createGain(); fm1.gain.value = 170; lfo.connect(fm1);
   const fm2 = c.createGain(); fm2.gain.value = 340; lfo.connect(fm2);
@@ -1091,13 +1153,23 @@ function whistle(dur = 1.2) {
   const o2 = c.createOscillator(); o2.type = 'triangle'; o2.frequency.value = 5900; fm2.connect(o2.frequency);
   const g2 = c.createGain(); g2.gain.value = 0.18; o2.connect(g2); g2.connect(am);
   am.connect(master);
-  // Luftrauschen
   const len = Math.floor(c.sampleRate * dur), buf = c.createBuffer(1, len, c.sampleRate), d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
   const n = c.createBufferSource(); n.buffer = buf;
   const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 3000; bp.Q.value = 1.5;
   const ng = c.createGain(); ng.gain.value = 0.22; n.connect(bp); bp.connect(ng); ng.connect(master);
   [lfo, o1, o2, n].forEach(x => { x.start(t); x.stop(t + dur); });
+}
+function whistle() {
+  if (S.music.whistleType === 'file' && playCustom('whistle')) return;
+  const c = ac(); if (!c) return;
+  (S.music.whistleType === 'trill' ? synthWhistleTrill : synthWhistleClean)(c, c.destination, c.currentTime + 0.02, Math.min(1, sigVol() * 1.15));
+}
+function sndFileRow(kind, label) {
+  const has = !!customSnd[kind];
+  return `<div class="row"><label class="btn sm">${label} wählen …<input type="file" id="snd-${kind}" accept="audio/*,.mp3,.wav,.m4a,.ogg" hidden></label>
+    <span class="hint" style="margin:0">${has ? 'Eigene Datei gespeichert' : 'Noch keine Datei – bis dahin erklingt der eingebaute Klang'}</span>
+    ${has ? `<button class="btn sm" data-act="sndDel" data-k="${kind}">Entfernen</button>` : ''}</div>`;
 }
 
 /* ---- Mannschaftspläne ---- */
@@ -1236,6 +1308,7 @@ function bindAdmin() {
         S.kg.channel = newChannel(); S.kg.pending = []; save(); kgConnect(); renderAll(); break;
       case 'kgCopy': { const l = kgLink(+b.dataset.f); (navigator.clipboard ? navigator.clipboard.writeText(l) : Promise.reject()).then(() => toast('Link kopiert.')).catch(() => toast(l)); break; }
       case 'whistleTest': whistle(); break;
+      case 'sndDel': delete customSnd[b.dataset.k]; try { localStorage.setItem(SND_KEY, JSON.stringify(customSnd)); } catch (e) {} renderMusic(); break;
       case 'printTeams': printTeams(b.dataset.id || ($('#teamPrintSel') || {}).value || 'all'); break;
       case 'delLogo': S.logos.splice(+b.dataset.i, 1); save(); renderAll(); break;
       case 'dockToggle': $('#spDock').classList.toggle('min'); break;
@@ -1301,7 +1374,26 @@ function bindAdmin() {
       onTiming(); renderAll(); return;
     }
     if (t.name === 'msrc') { S.music.source = t.value; if (Music.playing) Music.stop(true); save(); renderMusic(); renderTabs(); updateClockUI(); return; }
-    if (t.dataset.mus) { const k = t.dataset.mus; S.music[k] = t.type === 'checkbox' ? t.checked : +t.value; save(); updateClockUI(); return; }
+    if (t.dataset.mus) {
+      const k = t.dataset.mus;
+      S.music[k] = t.type === 'checkbox' ? t.checked : (t.value !== '' && !isNaN(+t.value) ? +t.value : t.value);
+      save(); updateClockUI();
+      if (k === 'whistleType' || k === 'hornType') renderMusic();
+      return;
+    }
+    if (t.id === 'snd-whistle' || t.id === 'snd-horn') {
+      const kind = t.id.slice(4), f = t.files[0]; t.value = '';
+      if (!f) return;
+      if (f.size > 1.5 * 1024 * 1024) { toast('Die Datei ist zu groß (maximal 1,5 MB). Bitte einen kürzeren Ausschnitt wählen.'); return; }
+      const r = new FileReader();
+      r.onload = () => {
+        const prev = customSnd[kind]; customSnd[kind] = r.result;
+        try { localStorage.setItem(SND_KEY, JSON.stringify(customSnd)); toast('Sounddatei gespeichert.'); }
+        catch (e) { customSnd[kind] = prev; toast('Speicher voll – bitte eine kleinere Datei wählen.'); }
+        renderMusic(); (kind === 'horn' ? horn : whistle)();
+      };
+      r.readAsDataURL(f); return;
+    }
     if (t.dataset.kg) {
       const k = t.dataset.kg;
       S.kg[k] = t.type === 'checkbox' ? t.checked : t.value.trim();
