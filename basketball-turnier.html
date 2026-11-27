@@ -1560,7 +1560,9 @@ function bindAdmin() {
       case 'openDisplay': openDisplay(); break;
       case 'print': printPlan(); break;
       case 'export': {
-        const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
+        // Sicherung enthält auch eigene Sounddateien und ein hochgeladenes Regelplakat (liegen sonst getrennt im Browser)
+        const extras = { sounds: Object.assign({}, customSnd), poster: customPoster() || null };
+        const blob = new Blob([JSON.stringify(Object.assign({}, S, { extras }), null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
         a.download = (S.name || 'turnier').replace(/[^\wäöüÄÖÜß-]+/g, '_') + '_' + new Date().toISOString().slice(0, 10) + '.json';
         document.body.appendChild(a); a.click(); a.remove(); break;
@@ -1717,7 +1719,24 @@ function bindAdmin() {
     if (t.id === 'm-files') { Music.setFiles(t.files); return; }
     if (t.id === 'importFile') {
       const f = t.files[0]; if (!f) return;
-      f.text().then(txt => { const s = merge(JSON.parse(txt)); S = s; save(); adminSkeleton(); ui.tab = S.slots.length ? 'plan' : 'setup'; renderAll(); toast('Turnier geladen.'); })
+      f.text().then(txt => {
+        const raw = JSON.parse(txt), ex = raw.extras || null; delete raw.extras;
+        S = merge(raw);
+        const notes = [];
+        if (ex) {
+          if (ex.sounds && typeof ex.sounds === 'object') {
+            customSnd = {}; ['whistle', 'horn'].forEach(k => { if (typeof ex.sounds[k] === 'string' && ex.sounds[k].startsWith('data:audio')) customSnd[k] = ex.sounds[k]; });
+            try { localStorage.setItem(SND_KEY, JSON.stringify(customSnd)); if (Object.keys(customSnd).length) notes.push('eigene Klänge'); } catch (e) { notes.push('Klänge zu groß für den Speicher'); }
+          }
+          try {
+            if (typeof ex.poster === 'string' && ex.poster.startsWith('data:image')) { localStorage.setItem(POSTER_KEY, ex.poster); notes.push('Regelplakat'); }
+            else localStorage.removeItem(POSTER_KEY);
+          } catch (e) { notes.push('Plakat zu groß für den Speicher'); }
+        }
+        LV.key = null; LV.last = ''; LV.lastCore = '';
+        save(); adminSkeleton(); ui.tab = S.slots.length ? 'plan' : 'setup'; renderAll(); kgConnect(); livePublish();
+        toast('Turnier geladen' + (notes.length ? ' (inkl. ' + notes.join(', ') + ')' : '') + '.');
+      })
         .catch(() => toast('Datei konnte nicht gelesen werden.'));
       t.value = ''; return;
     }
